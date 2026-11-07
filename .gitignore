@@ -1,0 +1,8 @@
+build/
+build_host/
+managed_components/
+sdkconfig
+sdkconfig.old
+logs/*.csv
+.DS_Store
+.claude/
