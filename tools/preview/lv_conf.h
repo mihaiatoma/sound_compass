@@ -1,5 +1,6 @@
 // LVGL settings for the desktop preview. Matches the board: RGB565, float angles.
-#pragma once
+#ifndef LV_CONF_H
+#define LV_CONF_H
 #define LV_COLOR_DEPTH 16
 #define LV_USE_OS LV_OS_NONE
 #define LV_USE_FLOAT 1
@@ -9,3 +10,4 @@
 #define LV_USE_LOG 0
 #define LV_DRAW_SW_DRAW_UNIT_CNT 1
 #define LV_FONT_MONTSERRAT_14 1
+#endif

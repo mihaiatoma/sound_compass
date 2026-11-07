@@ -6,3 +6,4 @@ sdkconfig.old
 logs/*.csv
 .DS_Store
 .claude/
+backup/

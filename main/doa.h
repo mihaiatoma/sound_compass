@@ -58,6 +58,12 @@ void doa_track_update(doa_track_t *track, const doa_frame_t *frame);
 // from every later estimate and cancels any fixed offset between the channels.
 void doa_set_zero_offset_us(float tau_us);
 
+// Reads a calibration clap made past the top edge of the screen. A delay nearer
+// ahead than the mic line is a zero offset, and this returns 0. Otherwise the top
+// of the screen points along the mics, and this returns the clockwise quarter turns
+// (+1 or -1) that lay them across the screen, with MIC2's end on the right.
+int doa_clap_turn(float tau_us);
+
 #ifdef __cplusplus
 }
 #endif

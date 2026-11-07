@@ -5,13 +5,17 @@
 //   core 0  log_task     send one line of results over USB, 10 times a second
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
 #include "esp_check.h"
 #include "esp_codec_dev.h"
+#include "esp_heap_caps.h"
+#include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
+#include "esp_lv_adapter.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -19,17 +23,27 @@
 #include "nvs_flash.h"
 
 #include "doa.h"
+#include "turn.h"
 #include "ui.h"
 
 static const char *TAG = "compass";
 
-#define SLOTS        BSP_AUDIO_TDM_SLOT_COUNT   // MIC1, reference, MIC2, unused
-#define SLOT_LEFT    BSP_AUDIO_TDM_SLOT_FL
-#define SLOT_RIGHT   BSP_AUDIO_TDM_SLOT_FR
+// The ES7210 sends both mics as plain stereo and samples them at the same instant.
+// With the USB port at the bottom, MIC1 is on the left when facing the screen.
+#define CHANNELS     2
+#define SLOT_LEFT    0
+#define SLOT_RIGHT   1
 #define MIC_GAIN_DB  24.0f
-#define CAL_SECONDS  5.0f
+#define DISPLAY_BRIGHTNESS 85
+#define CAL_FRAMES   (5 * DOA_SAMPLE_RATE_HZ / DOA_HOP)   // 5 seconds
 #define NVS_SPACE    "compass"
 #define NVS_ZERO_KEY "zero_us"
+#define NVS_TURN_KEY "quarters"
+#define STRIP_PIXELS (BSP_LCD_H_RES * 8)                  // one piece sent to the panel
+
+// With the USB port at the bottom, the panel's own top edge faces left, so the
+// picture starts a quarter turn clockwise. A calibration clap can change this.
+#define DEFAULT_QUARTERS 1
 
 // Latest results, written by the audio task and read by the UI and the logger.
 typedef struct {
@@ -44,60 +58,87 @@ typedef struct {
 static shared_t s_shared;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool s_cal_requested;
-static volatile int  s_notice;       // 0 none, 1 calibrating, 2 done, 3 failed
+static volatile int  s_notice;       // 0 none, 1 calibrating, 2 zero set, 3 failed, 4 turned
+static volatile int  s_quarters;     // clockwise quarter turns of the picture on the panel
 static esp_codec_dev_handle_t s_mic;
 
 static float s_mic_l[DOA_FFT_N], s_mic_r[DOA_FFT_N];
-static int16_t s_raw[DOA_HOP * SLOTS];
+static int16_t s_raw[DOA_HOP * CHANNELS];
+static float s_cal_tau[CAL_FRAMES];
+static turn_strips_t s_strips = {.capacity = STRIP_PIXELS};
 
-static float load_zero_offset(void)
+static int32_t load_setting(const char *key, int32_t fallback)
 {
     nvs_handle_t h;
-    int32_t centi_us = 0;
+    int32_t value = fallback;
     if (nvs_open(NVS_SPACE, NVS_READONLY, &h) == ESP_OK) {
-        nvs_get_i32(h, NVS_ZERO_KEY, &centi_us);
+        nvs_get_i32(h, key, &value);
         nvs_close(h);
     }
-    return (float)centi_us / 100.0f;
+    return value;
 }
 
-static void save_zero_offset(float tau_us)
+static void save_setting(const char *key, int32_t value)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_SPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i32(h, NVS_ZERO_KEY, (int32_t)lroundf(tau_us * 100.0f));
+        nvs_set_i32(h, key, value);
         nvs_commit(h);
         nvs_close(h);
     }
 }
 
+static float load_zero_offset(void)
+{
+    return (float)load_setting(NVS_ZERO_KEY, 0) / 100.0f;
+}
+
+static void save_zero_offset(float tau_us)
+{
+    save_setting(NVS_ZERO_KEY, (int32_t)lroundf(tau_us * 100.0f));
+}
+
+static int compare_floats(const void *a, const void *b)
+{
+    float x = *(const float *)a, y = *(const float *)b;
+    return (x > y) - (x < y);
+}
+
+// Decide what the claps meant, from the median delay, which ignores stray frames.
+// A clap along the mic line turns the screen and says nothing about the zero.
+static float finish_calibration(float *tau_us, int count)
+{
+    qsort(tau_us, (size_t)count, sizeof(float), compare_floats);
+    float median = tau_us[count / 2];
+    int turn = doa_clap_turn(median);
+    float zero_us = turn == 0 ? median : 0.0f;
+    save_zero_offset(zero_us);
+    if (turn != 0) {
+        s_quarters = (s_quarters + turn + 4) % 4;
+        save_setting(NVS_TURN_KEY, s_quarters);
+    }
+    s_notice = turn == 0 ? 2 : 4;
+    ESP_LOGI(TAG, "calibration: %d frames, median %.1f us, turn %d", count, median, turn);
+    return zero_us;
+}
+
 static esp_err_t audio_start(void)
 {
-    ESP_RETURN_ON_ERROR(bsp_audio_init_voice_24k(), TAG, "audio bus");
-
-    // The board shares its audio clocks with the speaker codec, so it has to be
-    // opened too. It stays muted and nothing is ever played.
+    // The speaker codec shares the audio clocks with the mics, so it is opened too.
+    // It stays muted and nothing is ever played.
     esp_codec_dev_handle_t speaker = bsp_audio_codec_speaker_init();
     s_mic = bsp_audio_codec_microphone_init();
     ESP_RETURN_ON_FALSE(speaker && s_mic, ESP_FAIL, TAG, "codec init");
 
-    esp_codec_dev_sample_info_t out_fs = {
+    esp_codec_dev_sample_info_t fs = {
         .sample_rate = DOA_SAMPLE_RATE_HZ,
-        .channel = 2,
+        .channel = CHANNELS,
         .bits_per_sample = 16,
     };
-    esp_codec_dev_sample_info_t in_fs = {
-        .sample_rate = DOA_SAMPLE_RATE_HZ,
-        .channel = SLOTS,
-        .channel_mask = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0) | ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1) |
-                        ESP_CODEC_DEV_MAKE_CHANNEL_MASK(2) | ESP_CODEC_DEV_MAKE_CHANNEL_MASK(3),
-        .bits_per_sample = 16,
-    };
-    ESP_RETURN_ON_FALSE(esp_codec_dev_open(speaker, &out_fs) == ESP_CODEC_DEV_OK, ESP_FAIL, TAG, "speaker open");
+    ESP_RETURN_ON_FALSE(esp_codec_dev_open(speaker, &fs) == ESP_CODEC_DEV_OK, ESP_FAIL, TAG, "speaker open");
     esp_codec_dev_set_out_mute(speaker, true);
-    ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_mic, &in_fs) == ESP_CODEC_DEV_OK, ESP_FAIL, TAG, "mic open");
-    ESP_RETURN_ON_FALSE(esp_codec_dev_set_in_channel_gain(s_mic, BSP_AUDIO_ES7210_MIC_MASK_FL_FR, MIC_GAIN_DB) == ESP_CODEC_DEV_OK,
-                        ESP_FAIL, TAG, "mic gain");
+    ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_mic, &fs) == ESP_CODEC_DEV_OK, ESP_FAIL, TAG, "mic open");
+    ESP_RETURN_ON_FALSE(esp_codec_dev_set_in_gain(s_mic, MIC_GAIN_DB) == ESP_CODEC_DEV_OK, ESP_FAIL, TAG, "mic gain");
     return ESP_OK;
 }
 
@@ -111,11 +152,10 @@ static void audio_task(void *arg)
     doa_set_zero_offset_us(zero_us);
     doa_track_t track;
     doa_track_reset(&track);
-    ESP_LOGI(TAG, "spacing %.1f mm, zero offset %.1f us", cfg.mic_spacing_m * 1000.0f, zero_us);
+    ESP_LOGI(TAG, "spacing %.1f mm, zero offset %.1f us, quarter turns %d",
+             cfg.mic_spacing_m * 1000.0f, zero_us, s_quarters);
 
-    float cal_sum = 0.0f;
     int cal_frames = 0, cal_left = 0;
-    const int cal_total = (int)(CAL_SECONDS * DOA_SAMPLE_RATE_HZ / DOA_HOP);
     uint32_t frames = 0;
 
     while (true) {
@@ -128,15 +168,14 @@ static void audio_task(void *arg)
         memmove(s_mic_l, s_mic_l + DOA_HOP, (DOA_FFT_N - DOA_HOP) * sizeof(float));
         memmove(s_mic_r, s_mic_r + DOA_HOP, (DOA_FFT_N - DOA_HOP) * sizeof(float));
         for (int i = 0; i < DOA_HOP; i++) {
-            s_mic_l[DOA_FFT_N - DOA_HOP + i] = (float)s_raw[i * SLOTS + SLOT_LEFT] / 32768.0f;
-            s_mic_r[DOA_FFT_N - DOA_HOP + i] = (float)s_raw[i * SLOTS + SLOT_RIGHT] / 32768.0f;
+            s_mic_l[DOA_FFT_N - DOA_HOP + i] = (float)s_raw[i * CHANNELS + SLOT_LEFT] / 32768.0f;
+            s_mic_r[DOA_FFT_N - DOA_HOP + i] = (float)s_raw[i * CHANNELS + SLOT_RIGHT] / 32768.0f;
         }
 
         if (s_cal_requested) {
             s_cal_requested = false;
-            cal_sum = 0.0f;
             cal_frames = 0;
-            cal_left = cal_total;
+            cal_left = CAL_FRAMES;
             doa_set_zero_offset_us(0.0f);
             s_notice = 1;
         }
@@ -149,14 +188,11 @@ static void audio_task(void *arg)
 
         if (cal_left > 0) {
             if (frame.sound) {
-                cal_sum += frame.tau_us;
-                cal_frames++;
+                s_cal_tau[cal_frames++] = frame.tau_us;
             }
             if (--cal_left == 0) {
                 if (cal_frames >= 4) {
-                    zero_us = cal_sum / (float)cal_frames;
-                    save_zero_offset(zero_us);
-                    s_notice = 2;
+                    zero_us = finish_calibration(s_cal_tau, cal_frames);
                 } else {
                     s_notice = 3;
                 }
@@ -209,6 +245,30 @@ static void on_long_press(void)
     s_cal_requested = true;
 }
 
+static int send_strip(const turn_rect_t *r, const uint16_t *pixels, void *panel)
+{
+    return esp_lcd_panel_draw_bitmap(panel, r->x1, r->y1, r->x2, r->y2, pixels);
+}
+
+// Every update leaves through here, for two reasons. The display adapter does not
+// rotate on QSPI panels, and this panel's axis swap is unproven and would need its
+// 6 pixel gap moved too, so rectangles are turned here. And LVGL draws in PSRAM,
+// which the SPI driver sends through a temporary copy in internal memory. Blocks as
+// large as 46 KB are not always free there, and a failed update leaves old pixels
+// on screen, so pieces go out from small buffers that are always there.
+//
+// The panel driver waits for one piece to finish before it starts the next. Each
+// piece also reports "transfer done" to LVGL, which is harmless: LVGL is held here
+// until the last piece is on its way, and its pixels are copied by then.
+static esp_err_t draw_turned(lv_display_t *disp, esp_lcd_panel_handle_t panel,
+                             int x1, int y1, int x2, int y2, const void *pixels, void *ctx)
+{
+    (void)disp;
+    (void)ctx;
+    turn_rect_t rect = {x1, y1, x2, y2};
+    return turn_send_strips(&s_strips, s_quarters, BSP_LCD_H_RES, rect, pixels, send_strip, panel);
+}
+
 static void ui_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
@@ -223,13 +283,17 @@ static void ui_timer_cb(lv_timer_t *timer)
     if (notice != shown_notice) {
         shown_notice = notice;
         if (notice == 1) {
-            ui_set_notice("ZEROING", "clap straight ahead");
+            ui_set_notice("ZEROING", "clap past the top edge");
         } else if (notice == 2) {
             ui_set_notice("ZERO SET", "saved on the board");
             notice_until_us = now + 1500000;
         } else if (notice == 3) {
             ui_set_notice("NOT ENOUGH SOUND", "hold to try again");
             notice_until_us = now + 2500000;
+        } else if (notice == 4) {
+            // A notice redraws the whole screen, so the new turn takes effect at once.
+            ui_set_notice("TURNED", "turn the board to match");
+            notice_until_us = now + 3000000;
         }
     }
     if (notice_until_us && now > notice_until_us) {
@@ -255,10 +319,20 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
+    s_quarters = load_setting(NVS_TURN_KEY, DEFAULT_QUARTERS) & 3;
+    for (int i = 0; i < 2; i++) {
+        s_strips.buffer[i] = heap_caps_malloc(STRIP_PIXELS * sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        assert(s_strips.buffer[i]);
+    }
+
     lv_display_t *display = bsp_display_start();
     assert(display);
 
-    bsp_display_lock(0);
+    bsp_display_brightness_set(DISPLAY_BRIGHTNESS);
+
+    bsp_display_lock(-1);   // -1 waits for as long as it takes
+    const esp_lv_adapter_draw_bitmap_callbacks_t draw = {.custom_draw_bitmap = draw_turned};
+    ESP_ERROR_CHECK(esp_lv_adapter_set_draw_bitmap_callbacks(display, &draw, NULL));
     ui_init(lv_screen_active(), on_long_press);
     lv_timer_create(ui_timer_cb, 33, NULL);
     bsp_display_unlock();

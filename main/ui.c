@@ -37,13 +37,13 @@ LV_FONT_DECLARE(font_small_21);
 #define TICK_MAJOR   18
 #define BEAM_OUTER   208
 #define BEAM_WIDTH   8
-#define NEEDLE_FROM  128
-#define NEEDLE_TO    190
+#define GLOW_LAYERS  4
+#define GLOW_STEP    3             // px added on each side per layer
 #define HEAT_BASE    184
 #define HEAT_LENGTH  38
 #define HEAT_BINS    37            // one bar every 5 degrees
 #define LEVEL_RADIUS 188
-#define LEVEL_WIDTH  5
+#define LEVEL_WIDTH  3
 #define LEVEL_SPAN   66.0f
 #define RING_MIN     118.0f
 #define RING_MAX     150.0f
@@ -169,6 +169,9 @@ static void draw_scale(lv_layer_t *layer)
     d.width = 2;
     d.color = lv_color_hex(COL_TICK_LOW);
     for (int a = 105; a <= 255; a += 15) {
+        if (a == 150 || a == 210) {
+            continue;              // the mic rings sit here
+        }
         draw_radial(layer, &d, (float)a, (float)(TICK_OUTER - TICK_MINOR), (float)TICK_OUTER);
     }
 }
@@ -228,18 +231,12 @@ static void draw_beam(lv_layer_t *layer)
 
     draw_arc(layer, CX, CY, BEAM_OUTER - 2, 3, ghost - s, ghost + s, c, (lv_opa_t)(70.0f * f), true);
 
-    draw_arc(layer, CX, CY, BEAM_OUTER + 9, BEAM_WIDTH + 18, a - s - 2, a + s + 2, c, (lv_opa_t)(22.0f * f), true);
-    draw_arc(layer, CX, CY, BEAM_OUTER + 4, BEAM_WIDTH + 8, a - s - 1, a + s + 1, c, (lv_opa_t)(46.0f * f), true);
+    // Soft glow from stacked translucent arcs, widest and faintest first.
+    for (int i = GLOW_LAYERS; i >= 1; i--) {
+        int32_t grow = i * GLOW_STEP;
+        draw_arc(layer, CX, CY, BEAM_OUTER + grow, BEAM_WIDTH + 2 * grow, a - s, a + s, c, (lv_opa_t)(15.0f * f), true);
+    }
     draw_arc(layer, CX, CY, BEAM_OUTER, BEAM_WIDTH, a - s, a + s, c, (lv_opa_t)(255.0f * f), true);
-
-    lv_draw_line_dsc_t d;
-    lv_draw_line_dsc_init(&d);
-    d.width = 2;
-    d.round_start = 1;
-    d.round_end = 1;
-    d.color = c;
-    d.opa = (lv_opa_t)(190.0f * f);
-    draw_radial(layer, &d, ui.angle, (float)NEEDLE_FROM, (float)NEEDLE_TO);
 }
 
 static void draw_idle_ring(lv_layer_t *layer)
@@ -319,14 +316,15 @@ void ui_init(lv_obj_t *screen, ui_long_press_cb_t on_long_press)
     lv_obj_align(ui.detail, LV_ALIGN_TOP_MID, 0, 335);
     lv_obj_align(ui.title, LV_ALIGN_CENTER, 0, -18);
     lv_obj_align(ui.subtitle, LV_ALIGN_CENTER, 0, 20);
-    lv_obj_align(ui.db[0], LV_ALIGN_TOP_LEFT, 94, 330);
-    lv_obj_align(ui.db[1], LV_ALIGN_TOP_RIGHT, -94, 330);
+    lv_obj_align(ui.db[0], LV_ALIGN_TOP_MID, -58, 364);
+    lv_obj_align(ui.db[1], LV_ALIGN_TOP_MID, 58, 364);
 }
 
 void ui_set_notice(const char *title, const char *detail)
 {
     ui.notice = title != NULL;
     ui.idle_shown = false;
+    lv_obj_invalidate(ui.field);
     if (ui.notice) {
         lv_label_set_text(ui.title, title);
         lv_label_set_text(ui.subtitle, detail ? detail : "");
@@ -347,6 +345,14 @@ static void set_tracking_text_visible(bool visible)
     }
 }
 
+// Setting a label redraws it, so skip it when the text has not changed.
+static void set_text(lv_obj_t *label, const char *text)
+{
+    if (strcmp(lv_label_get_text(label), text) != 0) {
+        lv_label_set_text(label, text);
+    }
+}
+
 static void update_readout(const ui_state_t *s)
 {
     int degrees = (int)lroundf(fabsf(ui.angle));
@@ -363,9 +369,7 @@ static void update_readout(const ui_state_t *s)
     }
 
     const char *word = degrees < 7 ? "AHEAD" : (ui.angle < 0 ? "LEFT" : "RIGHT");
-    if (strcmp(lv_label_get_text(ui.word), word) != 0) {
-        lv_label_set_text(ui.word, word);
-    }
+    set_text(ui.word, word);
     lv_obj_set_style_text_color(ui.word, color, 0);
 
     char detail[40];
@@ -375,13 +379,21 @@ static void update_readout(const ui_state_t *s)
     } else {
         snprintf(detail, sizeof(detail), "%s mic first \xC2\xB7 %d \xC2\xB5s", ui.angle < 0 ? "left" : "right", gap);
     }
-    lv_label_set_text(ui.detail, detail);
-    lv_label_set_text(ui.status, s->live ? "HEARING" : "LAST HEARD");
+    set_text(ui.detail, detail);
+    set_text(ui.status, s->age_s < 0.6f ? "HEARING" : "LAST HEARD");
 
     lv_opa_t opa = (lv_opa_t)(60.0f + 195.0f * ui.fade);
     lv_obj_set_style_text_opa(ui.digits, opa, 0);
     lv_obj_set_style_text_opa(ui.degree, opa, 0);
     lv_obj_set_style_text_opa(ui.word, opa, 0);
+}
+
+static void invalidate_bin(int i)
+{
+    lv_area_t a;
+    float b = -90.0f + 5.0f * (float)i;
+    sector_area(b - 2.0f, b + 2.0f, (float)(HEAT_BASE - HEAT_LENGTH), (float)HEAT_BASE, &a);
+    lv_obj_invalidate_area(ui.field, &a);
 }
 
 static void update_heat(const ui_state_t *s, float dt)
@@ -395,50 +407,50 @@ static void update_heat(const ui_state_t *s, float dt)
             }
             float weight = i == centre ? 0.11f : 0.04f;
             ui.heat[i] = clampf(ui.heat[i] + weight * s->confidence, 0.0f, 1.0f);
-            lv_area_t a;
-            float b = -90.0f + 5.0f * (float)i;
-            sector_area(b - 2.0f, b + 2.0f, (float)(HEAT_BASE - HEAT_LENGTH), (float)HEAT_BASE, &a);
-            lv_obj_invalidate_area(ui.field, &a);
+            invalidate_bin(i);
         }
     }
 
-    // Decay in steps, because each step redraws the whole band.
+    // Decay in steps, so the bars redraw a few times a second and not every frame.
     ui.decay_timer += dt;
     if (ui.decay_timer >= 0.16f) {
-        bool any = false;
         float k = powf(0.5f, ui.decay_timer / 2.2f);
+        ui.decay_timer = 0.0f;
         for (int i = 0; i < HEAT_BINS; i++) {
             if (ui.heat[i] > 0.0f) {
                 ui.heat[i] *= k;
                 if (ui.heat[i] < 0.02f) {
                     ui.heat[i] = 0.0f;
                 }
-                any = true;
+                invalidate_bin(i);
             }
-        }
-        ui.decay_timer = 0.0f;
-        if (any) {
-            lv_area_t band = {CX - HEAT_BASE - 4, CY - HEAT_BASE - 4, CX + HEAT_BASE + 4, CY + 8};
-            lv_obj_invalidate_area(ui.field, &band);
         }
     }
 }
 
+// Screen angle of a level arc's moving end.
+static float level_end(int m, float level)
+{
+    return m == 0 ? 102.0f + LEVEL_SPAN * level : 78.0f - LEVEL_SPAN * level;
+}
+
 static void update_levels(const ui_state_t *s, float dt)
 {
-    bool changed = false;
+    static const int32_t mic_x[2] = {MIC_L_X, MIC_R_X};
     for (int m = 0; m < 2; m++) {
-        float target = clampf((s->level_db[m] + 72.0f) / 54.0f, 0.0f, 1.0f);
+        float target = clampf((s->level_db[m] + 70.0f) / 60.0f, 0.0f, 1.0f);
         float rate = target > ui.level[m] ? 26.0f : 5.0f;
         float next = ui.level[m] + (1.0f - expf(-rate * dt)) * (target - ui.level[m]);
-        changed |= fabsf(next - ui.level[m]) > 0.004f;
+        if (fabsf(next - ui.level[m]) > 0.004f) {
+            // Redraw only the stretch of arc that moved.
+            float a0 = level_end(m, ui.level[m]) - 270.0f, a1 = level_end(m, next) - 270.0f;
+            lv_area_t arc;
+            sector_area(a0, a1, (float)(LEVEL_RADIUS - LEVEL_WIDTH), (float)LEVEL_RADIUS, &arc);
+            lv_obj_invalidate_area(ui.field, &arc);
+            lv_area_t ring = {mic_x[m] - 11, MIC_Y - 11, mic_x[m] + 11, MIC_Y + 11};
+            lv_obj_invalidate_area(ui.field, &ring);
+        }
         ui.level[m] = next;
-    }
-    if (changed) {
-        lv_area_t left = {38, CY + 30, CX - 18, SIZE - 30};
-        lv_area_t right = {CX + 18, CY + 30, SIZE - 38, SIZE - 30};
-        lv_obj_invalidate_area(ui.field, &left);
-        lv_obj_invalidate_area(ui.field, &right);
     }
 
     ui.db_timer += dt;
@@ -507,8 +519,10 @@ void ui_update(const ui_state_t *s, float dt)
         ui.spread += (1.0f - expf(-8.0f * dt)) * (target - ui.spread);
         ui.fade = clampf(1.0f - (s->age_s - 0.25f) / 2.25f, 0.0f, 1.0f);
 
-        float m = ui.spread + 4.0f;
-        sector_area(ui.angle - m, ui.angle + m, (float)(NEEDLE_FROM - 2), (float)(BEAM_OUTER + 12), &ui.beam_area);
+        // Rounded ends and the glow reach a few degrees past the arc itself.
+        float m = ui.spread + 7.0f;
+        int32_t glow = GLOW_LAYERS * GLOW_STEP;
+        sector_area(ui.angle - m, ui.angle + m, (float)(BEAM_OUTER - BEAM_WIDTH - glow), (float)(BEAM_OUTER + glow), &ui.beam_area);
         sector_area(180.0f - ui.angle - m, 180.0f - ui.angle + m, (float)(BEAM_OUTER - 8), (float)(BEAM_OUTER + 2), &ui.ghost_area);
         lv_obj_invalidate_area(ui.field, &ui.beam_area);
         lv_obj_invalidate_area(ui.field, &ui.ghost_area);

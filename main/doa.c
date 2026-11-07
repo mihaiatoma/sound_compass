@@ -176,6 +176,15 @@ void doa_set_zero_offset_us(float tau_us)
     s_zero_offset_s = tau_us * 1e-6f;
 }
 
+int doa_clap_turn(float tau_us)
+{
+    const float halfway = s_tau_max_s * 1e6f * 0.70710678f;   // sin(45 degrees)
+    if (tau_us > halfway) {
+        return -1;
+    }
+    return tau_us < -halfway ? 1 : 0;
+}
+
 static float level_db(float sum_squares)
 {
     float rms2 = sum_squares / (float)DOA_FFT_N;

@@ -115,7 +115,7 @@ int main(void)
     save("5_last_heard");
 
     quiet(&s, 3.0f, false);
-    ui_set_notice("ZEROING", "clap straight ahead");
+    ui_set_notice("ZEROING", "clap past the top edge");
     quiet(&s, 0.5f, false);
     save("6_zeroing");
     return 0;

@@ -151,6 +151,8 @@ static void add_reverb(double angle_unused)
 }
 
 static int s_reverb;
+static float s_frame_tau[LEN / DOA_HOP];   // delays of the usable frames of the last case
+static int s_frame_tau_n;
 
 static result_t run_case(double angle_deg, int kind, double noise_rms, double common_hum)
 {
@@ -170,6 +172,7 @@ static result_t run_case(double angle_deg, int kind, double noise_rms, double co
 
     result_t r = {0};
     double sum = 0;
+    s_frame_tau_n = 0;
     for (int pos = 0; pos + DOA_FFT_N <= LEN; pos += DOA_HOP) {
         for (int i = 0; i < DOA_FFT_N; i++) {
             double hum = common_hum * sin(2 * PI * 3100.0 * (pos + i) / DOA_SAMPLE_RATE_HZ);
@@ -202,6 +205,7 @@ static result_t run_case(double angle_deg, int kind, double noise_rms, double co
             }
             r.conf += f.confidence;
             r.used++;
+            s_frame_tau[s_frame_tau_n++] = f.tau_us;
         }
     }
     if (r.used) {
@@ -239,6 +243,35 @@ static void check_sweep(const char *name, int kind, double noise, double hum, do
 
 // A pure tone has one frequency, so its bearing is weak but it must not crash
 // and its side must still be right at moderate angles.
+static int compare_floats(const void *a, const void *b)
+{
+    float x = *(const float *)a, y = *(const float *)b;
+    return (x > y) - (x < y);
+}
+
+// Calibration claps, read the way main.c reads them: the median delay of the usable
+// frames has to separate "trim the zero" from "turn the screen", echoes included.
+static void check_calibration(void)
+{
+    static const struct { double angle; int turn; } cases[] = {
+        {-90, 1}, {-80, 1}, {-60, 1}, {-30, 0}, {-13, 0}, {0, 0}, {13, 0}, {30, 0}, {60, -1}, {80, -1}, {90, -1},
+    };
+    printf("\ncalibration claps in a reflective room\n  true  median_us  frames  turn\n");
+    s_reverb = 1;
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        run_case(cases[i].angle, SRC_CLAPS, 0.002, 0);
+        qsort(s_frame_tau, (size_t)s_frame_tau_n, sizeof(float), compare_floats);
+        float median = s_frame_tau_n ? s_frame_tau[s_frame_tau_n / 2] : 0.0f;
+        int turn = doa_clap_turn(median);
+        int ok = s_frame_tau_n >= 4 && turn == cases[i].turn;
+        printf("  %+4.0f   %+7.1f   %4d    %+d %s\n", cases[i].angle, median, s_frame_tau_n, turn, ok ? "" : "FAIL");
+        if (!ok) {
+            s_fail++;
+        }
+    }
+    s_reverb = 0;
+}
+
 static void check_tone(void)
 {
     result_t r = run_case(40, SRC_TONE, 0.0005, 0);
@@ -327,6 +360,7 @@ int main(void)
     check_sweep("speech-like in a reflective room", SRC_SPEECHLIKE, 0.002, 0, 15.0, 0.1);
     check_sweep("claps in a reflective room", SRC_CLAPS, 0.002, 0, 15.0, 0.04);   // about one frame per clap
     s_reverb = 0;
+    check_calibration();
     check_tone();
     check_silence();
     bench();
